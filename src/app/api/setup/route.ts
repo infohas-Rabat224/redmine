@@ -32,6 +32,11 @@ export async function POST(request: Request) {
         isActive: true,
         emailVerified: new Date(),
       },
+      select: {
+        id: true,
+        email: true,
+        name: true,
+      }
     });
 
     // Create default organization if not exists
