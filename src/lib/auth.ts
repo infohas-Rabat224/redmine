@@ -13,6 +13,8 @@ declare module "next-auth" {
       email: string;
       name?: string | null;
       image?: string | null;
+      role: string;
+      organizationId?: string | null;
     };
   }
   interface User {
@@ -20,6 +22,8 @@ declare module "next-auth" {
     email: string;
     name?: string | null;
     image?: string | null;
+    role: string;
+    organizationId?: string | null;
   }
 }
 
@@ -29,6 +33,8 @@ declare module "next-auth/jwt" {
     email: string;
     name?: string | null;
     picture?: string | null;
+    role: string;
+    organizationId?: string | null;
   }
 }
 
@@ -42,7 +48,6 @@ export const authOptions: NextAuthOptions = {
     signIn: "/auth/signin",
     signOut: "/auth/signout",
     error: "/auth/error",
-    verifyRequest: "/auth/verify-request",
   },
   providers: [
     GoogleProvider({
@@ -58,19 +63,50 @@ export const authOptions: NextAuthOptions = {
     CredentialsProvider({
       name: "credentials",
       credentials: {
-        email: { label: "Email", type: "email" },
+        identifier: { label: "Email or Username", type: "text" },
         password: { label: "Password", type: "password" },
       },
       async authorize(credentials) {
-        if (!credentials?.email || !credentials?.password) {
+        if (!credentials?.identifier || !credentials?.password) {
+          console.log("Missing credentials");
           return null;
         }
 
-        const user = await prisma.user.findUnique({
-          where: { email: credentials.email },
+        const identifier = credentials.identifier.toLowerCase().trim();
+        
+        // Find user by email or by name (username)
+        let user = await prisma.user.findUnique({
+          where: { email: identifier },
+          include: {
+            memberships: {
+              where: { isActive: true },
+              orderBy: { joinedAt: "desc" },
+              take: 1,
+            },
+          },
         });
 
-        if (!user || !user.password) {
+        // If not found by email, try to find by name (case-insensitive username lookup)
+        if (!user) {
+          user = await prisma.user.findFirst({
+            where: { 
+              name: { 
+                equals: credentials.identifier.trim(),
+                mode: 'insensitive'
+              } 
+            },
+            include: {
+              memberships: {
+                where: { isActive: true },
+                orderBy: { joinedAt: "desc" },
+                take: 1,
+              },
+            },
+          });
+        }
+
+        if (!user || !user.password || !user.isActive) {
+          console.log("User not found or inactive:", identifier);
           return null;
         }
 
@@ -80,7 +116,18 @@ export const authOptions: NextAuthOptions = {
         );
 
         if (!isPasswordValid) {
+          console.log("Invalid password for:", identifier);
           return null;
+        }
+
+        // Update last login
+        try {
+          await prisma.user.update({
+            where: { id: user.id },
+            data: { lastLoginAt: new Date() },
+          });
+        } catch (e) {
+          console.log("Could not update lastLoginAt");
         }
 
         return {
@@ -88,6 +135,8 @@ export const authOptions: NextAuthOptions = {
           email: user.email,
           name: user.name,
           image: user.image,
+          role: user.memberships[0]?.role || "GUEST",
+          organizationId: user.memberships[0]?.organizationId || null,
         };
       },
     }),
@@ -99,6 +148,8 @@ export const authOptions: NextAuthOptions = {
         token.email = user.email;
         token.name = user.name;
         token.picture = user.image;
+        token.role = (user as any).role || "GUEST";
+        token.organizationId = (user as any).organizationId || null;
       }
       return token;
     },
@@ -109,6 +160,8 @@ export const authOptions: NextAuthOptions = {
           email: token.email,
           name: token.name,
           image: token.picture,
+          role: token.role,
+          organizationId: token.organizationId,
         };
       }
       return session;
@@ -118,14 +171,15 @@ export const authOptions: NextAuthOptions = {
         return true;
       }
 
-      // For OAuth providers, check if user exists or create
+      // For OAuth providers
       if (user.email) {
         const existingUser = await prisma.user.findUnique({
           where: { email: user.email },
+          include: { memberships: true },
         });
 
         if (!existingUser) {
-          // User will be created by PrismaAdapter
+          // Create user with OAuth - will be handled by PrismaAdapter
           return true;
         }
       }
@@ -135,10 +189,7 @@ export const authOptions: NextAuthOptions = {
   },
   events: {
     async signIn({ user }) {
-      await prisma.user.update({
-        where: { id: user.id },
-        data: { lastLoginAt: new Date() },
-      });
+      console.log(`User signed in: ${user.email}`);
     },
   },
   debug: process.env.NODE_ENV === "development",
@@ -158,6 +209,14 @@ export const requireAuth = async () => {
   const user = await getCurrentUser();
   if (!user) {
     throw new Error("Unauthorized");
+  }
+  return user;
+};
+
+export const requireAdmin = async () => {
+  const user = await requireAuth();
+  if (user.role !== "OWNER" && user.role !== "ADMIN") {
+    throw new Error("Admin access required");
   }
   return user;
 };
